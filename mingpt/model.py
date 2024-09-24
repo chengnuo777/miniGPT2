@@ -75,3 +75,5 @@ class Block(nn.Module):
         # gpt2是先layernorm，原生Transformer是后layernorm
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlpf(self.ln_2(x))
+
+# def load_checkpoint(model, checkpoint):
