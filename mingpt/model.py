@@ -148,6 +148,142 @@ class GPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """
+        Initialize a pretrained GPT model by copying over the weights
+        from a huggingface/transformers checkpoints
+        """
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+
+        # create a from-scratch initialized minGPT model
+        config = cls.get_default_config()
+        config.model_type = model_type
+        config.vocab_size = 50257
+        config.block_size = 1024
+        model = GPT(config)
+        sd = model.state_dict()
+
+        # init a huggingface model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy parameters
+        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')]  # ignore these
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # openai checkpoints use “Conv1D" module， we uese a vanilla nn.Linear.
+        # this means that we have to transpose these weights when wo import them
+        assert len(keys) == len(sd)
+        for k in keys:
+            if any(k.endswith(w) for w in transposed):
+                # transpose copy
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # copy
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def configure_optimizers(self, train_config):
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, )
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn
+                if pn.endswith('bias'):
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+
+        param_dict = {pn: p for pn, p in self.named_modules()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        return optimizer
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape(1, t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embedding (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # positino embedding (1, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1), targets.view(-1), ignore_index=-1))
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b, t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size]
+            # forward them model to get the logits
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            # crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+
+            # apply softmax to logits to probabilities
+            probs = F.softmax(logits, dim=-1)
+
+            # either sample form the distribution or take the most likely element
+            if do_sample:
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = torch.topk(probs, k=1, dim=1)
+
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
+
+
+
+
 
 
 
